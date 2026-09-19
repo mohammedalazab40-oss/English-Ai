@@ -1,0 +1,26 @@
+{
+  "name": "English Master AI",
+  "short_name": "English AI",
+  "description": "Learn English with an AI voice teacher: speaking, listening, vocabulary, grammar, reading, writing and exams.",
+  "id": "./",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait",
+  "background_color": "#0F1E4D",
+  "theme_color": "#2F5CFF",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": ["education", "productivity"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Voice conversation", "short_name": "Talk", "url": "./index.html?go=call", "icons": [{ "src": "icon-192.png", "sizes": "192x192" }] },
+    { "name": "Vocabulary", "short_name": "Words", "url": "./index.html?go=vocab", "icons": [{ "src": "icon-192.png", "sizes": "192x192" }] },
+    { "name": "Listening", "short_name": "Listen", "url": "./index.html?go=listening", "icons": [{ "src": "icon-192.png", "sizes": "192x192" }] }
+  ]
+}
