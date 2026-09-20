@@ -228,6 +228,13 @@ a{color:inherit;text-decoration:none;}
 .badge-tile .bico{width:46px;height:46px;border-radius:50%;margin:0 auto 9px;display:flex;align-items:center;justify-content:center;
   background:linear-gradient(135deg,var(--purple),var(--blue));}
 .badge-tile b{font-size:12px;display:block;}
+.badge-tile{cursor:pointer;opacity:1;position:relative;}
+.badge-tile:not(.unlocked) .bico{filter:grayscale(1);opacity:.45;}
+.badge-tile:not(.unlocked) b{color:var(--ink-2);}
+.badge-tile .bprog{height:6px;border-radius:4px;background:var(--line);margin:9px 4px 5px;overflow:hidden;}
+.badge-tile .bprog i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,var(--purple),var(--blue));}
+.badge-tile small{font-size:11px;color:var(--ink-2);display:block;}
+.badge-tile.unlocked small{color:var(--success);font-weight:600;}
 
 /* ---------- Daily challenge banner ---------- */
 .challenge-banner{
@@ -831,7 +838,7 @@ const MODE_PROMPTS = {
   role_play:'Invent a short, fun scenario with a clear character for yourself and a role for the student, say in one sentence who you both are, then STAY in character and let the scene develop with small surprises.',
 };
 /* ---- TEACHER CONTROL: the student decides how the AI teacher behaves (saved per user) ---- */
-const TUTOR_DEFAULT = {instructions:'', topic:'', length:'medium', correction:'major', speed:'auto', question:true, nativeHelp:true};
+const TUTOR_DEFAULT = {instructions:'', topic:'', length:'medium', correction:'major', voiceCorr:'speak', speed:'auto', question:true, nativeHelp:true};
 function getTutorCfg(){ try{ return Object.assign({}, TUTOR_DEFAULT, JSON.parse(uGet('tutor_cfg')||'{}')); }catch(e){ return Object.assign({}, TUTOR_DEFAULT); } }
 function setTutorCfg(c){ uSet('tutor_cfg', JSON.stringify(c)); }
 function tutorSystemPrompt(level, mode){
@@ -854,6 +861,7 @@ function tutorSystemPrompt(level, mode){
   p += c.question ? 'Most replies may end with ONE short, specific question that grows out of what was just said — but not every reply: about one reply in three should end with your own statement or opinion instead, so the student can react freely, as in real life. Never ask generic questions. ' : 'Do NOT end with a question unless the student asked you to; just say your part and let the student continue. ';
   p += corrRule+' The student text comes from speech recognition: ignore punctuation/capitalisation problems. ';
   p += c.nativeHelp ? 'The "reply" is in English, except when the student asks for the meaning of something or says they did not understand: then briefly explain in '+L+' inside "reply" and continue in English. ' : 'The "reply" field is in English only. ';
+  if(c.correction!=='none' && c.voiceCorr!=='off') p += 'When you fill "correction", "correct" must be the student\'s own sentence fixed, kept short and natural to say aloud. The app reads the correction aloud to the student by itself BEFORE your reply, so do NOT mention, repeat or explain the correction inside "reply" — "reply" is only the normal conversation. ';
   p += 'Also give "reply_translation": a natural '+L+' translation of your reply, and "user_translation": a '+L+' translation of what the student just said. Write the correction "explanation" in '+L+'. '+
     'Return ONLY JSON: {"reply":"...","reply_translation":"...","user_translation":"...","correction":null} or the same with "correction":{"correct":"the corrected sentence in English","explanation":"very short reason in '+L+'"}.';
   return p;
@@ -869,6 +877,7 @@ function openTutorControl(fromCall){
     <div class="field"><label>Topic — موضوع المحادثة (optional)</label><input id="tc_topic" dir="auto" value="${esc(c.topic)}" placeholder="e.g. hotel accounting, football, travel…"></div>
     <div class="field"><label>Reply length — طول الرد</label>${sel('tc_len',[['short','Short — one sentence'],['medium','Medium — 1-3 sentences'],['long','Long — 3-5 sentences']],c.length)}</div>
     <div class="field"><label>Corrections — التصحيح</label>${sel('tc_corr',[['all','Correct every mistake'],['major','Only important mistakes'],['none','Do not correct me']],c.correction)}</div>
+    <div class="field"><label>Voice correction — التصحيح الصوتي</label>${sel('tc_vcorr',[['speak','Teacher says the correction aloud — يصحح بصوته'],['repeat','Says it, then I repeat it — يصحح ثم أكرر بعده'],['off','On screen only — كتابة فقط']],c.voiceCorr)}</div>
     <div class="field"><label>Speaking speed — سرعة الكلام</label>${sel('tc_speed',[['auto','Automatic (by my level)'],['slow','Slow'],['normal','Normal'],['fast','Fast']],c.speed)}</div>
     <div class="field"><label style="display:flex;align-items:center;gap:10px;cursor:pointer;"><input id="tc_q" type="checkbox" ${c.question?'checked':''} style="width:20px;height:20px;"> Teacher ends with a question</label></div>
     <div class="field"><label style="display:flex;align-items:center;gap:10px;cursor:pointer;"><input id="tc_native" type="checkbox" ${c.nativeHelp?'checked':''} style="width:20px;height:20px;"> Explain in my language when I don't understand</label></div>
@@ -882,6 +891,7 @@ function saveTutorControl(){
     topic: document.getElementById('tc_topic').value.slice(0,200),
     length: document.getElementById('tc_len').value,
     correction: document.getElementById('tc_corr').value,
+    voiceCorr: document.getElementById('tc_vcorr').value,
     speed: document.getElementById('tc_speed').value,
     question: document.getElementById('tc_q').checked,
     nativeHelp: document.getElementById('tc_native').checked,
@@ -1914,6 +1924,7 @@ function startVoiceCall(){
   CALL.speaking = false;
   CALL.startTime = Date.now();
   CALL.ttsWarned = false;
+  CALL.practice = null; CALL.corrTurn = 0;
   AI_WARNED = false;
   unlockTTS();   // MUST run inside the user's tap, before any await
 
@@ -2134,26 +2145,86 @@ function toggleMic(){
   }
 }
 
+/* ---- spoken corrections ---- */
+const CORR_LEADS = ['Quick correction.', 'One small thing.', 'Just a small fix.', 'Let me correct one thing.', 'A little correction.'];
+const CORR_PRAISE = ['Perfect!', "That's it!", 'Exactly right!', 'Well done!', 'Much better!'];
+function pickLine(arr){ CALL.corrTurn = (CALL.corrTurn||0) + 1; return arr[CALL.corrTurn % arr.length]; }
+function normWords(t){ return String(t||'').toLowerCase().replace(/[’']/g,'').replace(/[^a-z0-9 ]/g,' ').split(/\s+/).filter(Boolean); }
+function sameSentence(a, b){ return normWords(a).join(' ') === normWords(b).join(' '); }
+/* how much of the target sentence the student managed to say (0..1) */
+function repeatScore(attempt, target){
+  const t = normWords(target), pool = normWords(attempt);
+  if(!t.length) return 0;
+  let hit = 0;
+  t.forEach(w=>{ const i = pool.indexOf(w); if(i>=0){ hit++; pool.splice(i,1); } });
+  return hit / t.length;
+}
+function finishPractice(userMsg, note){
+  if(userMsg){ userMsg.practice = note; renderTranscript(); }
+  CALL.practice = null;
+}
+async function deliverReply(data, prefix){
+  const reply = data.reply || "Sorry, could you say that again?";
+  const aiMsg = addMessage('ai', reply);
+  if(data.offline){ aiMsg.offline = data.offlineReason || 'AI not reachable'; renderTranscript(); }
+  if(data.reply_translation){ aiMsg.tr = String(data.reply_translation); renderTranscript(); }
+  else ensureTranslation(aiMsg);
+  await speakThenListen((prefix ? prefix+' ' : '') + reply);
+}
+async function handlePracticeAttempt(text){
+  const pr = CALL.practice;
+  const score = repeatScore(text, pr.target);
+  const said = normWords(text), before = normWords(pr.orig);
+  const fixedOk = normWords(pr.target).filter(w=>!before.includes(w)).every(w=>said.includes(w));   // the corrected words must be there
+  if(score >= 0.8 && fixedOk && !sameSentence(text, pr.orig)){
+    finishPractice(pr.userMsg, '🎤 ✓ '+text);
+    await deliverReply(pr.data, pickLine(CORR_PRAISE));
+    return;
+  }
+  if(score < 0.35){                       // the student moved on instead of repeating -> normal turn
+    const data = pr.data; finishPractice(pr.userMsg, '');
+    const reply = data.reply || '';
+    if(reply){ const m = addMessage('ai', reply); if(data.reply_translation) m.tr = String(data.reply_translation); }
+    await onUserFinishedSpeaking(text);
+    return;
+  }
+  if(pr.tries < 1){
+    pr.tries++;
+    pr.userMsg.practice = '🎤 … '+text; renderTranscript();
+    await speakThenListen('Almost. Listen again: '+pr.target+' Try once more.');
+    return;
+  }
+  finishPractice(pr.userMsg, '🎤 ≈ '+text);
+  await deliverReply(pr.data, 'Good try, we will practise it again later.');
+}
 async function onUserFinishedSpeaking(text){
   if(CALL.ended || !text) return;
+  if(CALL.practice){ await handlePracticeAttempt(text); return; }
   const userMsg = addMessage('user', text);
   setThinkingUI(true);
   try{
     const data = await apiGetAiReply(CALL.messages, CALL.level, CALL.mode);
     if(data.user_translation){ userMsg.tr = String(data.user_translation); renderTranscript(); }
     else ensureTranslation(userMsg);
-    if(data.correction && data.correction.correct){
+    let spokenCorr = '';
+    if(data.correction && data.correction.correct && !sameSentence(data.correction.correct, text)){
       userMsg.correction = data.correction.correct;
       userMsg.explanation = data.correction.explanation || '';
       renderTranscript();
+      const vc = getTutorCfg().voiceCorr;
+      if(vc !== 'off' && !CALL.muted){
+        const target = String(data.correction.correct).trim();
+        spokenCorr = pickLine(CORR_LEADS)+' We say: '+target+(/[.!?]$/.test(target)?'':'.');
+        if(vc === 'repeat' && normWords(target).length <= 14 && CALL.recognition){
+          CALL.practice = {target, orig:text, tries:0, data, userMsg};
+          await speakThenListen(spokenCorr+' Now you say it.');
+          return;
+        }
+      }
     }
-    const reply = data.reply || "Sorry, could you say that again?";
-    const aiMsg = addMessage('ai', reply);
-    if(data.offline){ aiMsg.offline = data.offlineReason || 'AI not reachable'; renderTranscript(); }
-    if(data.reply_translation){ aiMsg.tr = String(data.reply_translation); renderTranscript(); }
-    else ensureTranslation(aiMsg);
-    await speakThenListen(reply);
+    await deliverReply(data, spokenCorr);
   } catch(e){
+    CALL.practice = null;
     const fallback = "Sorry, I'm having trouble connecting right now. Could you say that again?";
     ensureTranslation(addMessage('ai', fallback));
     await speakThenListen(fallback);
@@ -2212,7 +2283,7 @@ function renderTranscript(){
       html += `<div class="hint" style="margin:-2px 8px 8px;color:#B7791F;font-size:11.5px;">⚠ Ready-made reply, not the AI — ${esc(m.offline)}</div>`;
     }
     if(m.correction){
-      html += `<div class="correction-box"><b>Correct:</b> ${esc(m.correction)}${m.explanation?'<br><span dir="auto" style="display:block;">'+esc(m.explanation)+'</span>':''}</div>`;
+      html += `<div class="correction-box"><b>Correct:</b> ${esc(m.correction)}${m.explanation?'<br><span dir="auto" style="display:block;">'+esc(m.explanation)+'</span>':''}${m.practice?'<br><span style="display:block;opacity:.85;">'+esc(m.practice)+'</span>':''}</div>`;
     }
     return html;
   }).join('');
@@ -3292,18 +3363,61 @@ function finishPlacementTest(level){
    ACHIEVEMENTS SCREEN
    ========================================================================= */
 const ACHIEVEMENT_EMOJI = {call:'📞', book:'📚', check:'✅', trophy:'🏆', fire:'🔥'};
+/* how each badge is earned: [current, target], Arabic explanation, where to go */
+const ACHIEVEMENT_INFO = {
+  first_conversation:{prog:p=>[p.completedConversations||0,1], how:'أكمل مكالمة صوتية واحدة مع المعلم (تكلّم مرة واحدة على الأقل ثم أنهِ المكالمة).', go:'call'},
+  speaking_master:{prog:p=>[p.completedConversations||0,10], how:'أكمل 10 مكالمات صوتية.', go:'call'},
+  words_50:{prog:p=>[p.vocabAnswered||0,50], how:'أجب عن 50 سؤال كلمات في قسم Vocabulary.', go:'vocabScreen'},
+  words_100:{prog:p=>[p.vocabAnswered||0,100], how:'أجب عن 100 سؤال كلمات في قسم Vocabulary.', go:'vocabScreen'},
+  words_500:{prog:p=>[p.vocabAnswered||0,500], how:'أجب عن 500 سؤال كلمات في قسم Vocabulary.', go:'vocabScreen'},
+  first_grammar:{prog:p=>[(p.grammarCompleted||[]).length,1], how:'أكمل درس قواعد واحداً مع تمرينه.', go:'grammarListScreen'},
+  grammar_10:{prog:p=>[(p.grammarCompleted||[]).length,10], how:'أكمل 10 دروس قواعد.', go:'grammarListScreen'},
+  grammar_all:{prog:p=>[(p.grammarCompleted||[]).length,33], how:'أكمل كل دروس القواعد (33 درساً).', go:'grammarListScreen'},
+  first_reading:{prog:p=>[(p.readingCompleted||[]).length,1], how:'اقرأ نصاً واحداً وأجب عن أسئلته.', go:'readingListScreen'},
+  reading_10:{prog:p=>[(p.readingCompleted||[]).length,10], how:'أكمل 10 نصوص قراءة.', go:'readingListScreen'},
+  first_listening:{prog:p=>[(p.listeningCompleted||[]).length,1], how:'استمع لمقطع واحد وأجب عن أسئلته.', go:'listeningListScreen'},
+  listening_10:{prog:p=>[(p.listeningCompleted||[]).length,10], how:'أكمل 10 مقاطع استماع.', go:'listeningListScreen'},
+  first_exam:{prog:p=>[p.examsCompleted||0,1], how:'أكمل أي امتحان مستوى حتى نهايته.', go:'examListScreen'},
+  exam_pass:{prog:p=>[Math.max(0,...Object.values(p.examBest||{}).map(Number).filter(n=>!isNaN(n))),70], unit:'%', how:'احصل على 70% أو أكثر في أي امتحان مستوى.', go:'examListScreen'},
+  streak_7:{prog:p=>[p.streakDays||0,7], unit:' days', how:'ادخل وتدرّب 7 أيام متتالية دون انقطاع.', go:'homeScreen'},
+  streak_30:{prog:p=>[p.streakDays||0,30], unit:' days', how:'ادخل وتدرّب 30 يوماً متتالياً دون انقطاع.', go:'homeScreen'},
+  xp_1000:{prog:p=>[p.xp||0,1000], unit:' XP', how:'اجمع 1000 نقطة XP من أي نشاط (مكالمات، دروس، كلمات، امتحانات).', go:'homeScreen'},
+};
+function achievementProgress(a, p){
+  const info = ACHIEVEMENT_INFO[a.id]; if(!info) return null;
+  let cur = 0, target = 1;
+  try{ [cur, target] = info.prog(p); }catch(e){}
+  return {cur: Math.min(cur, target), target, unit: info.unit||'', info};
+}
 function renderAchievementsScreen(){
-  const p = loadProgress();
-  document.getElementById('achievementsSummary').textContent =
-    p.achievements.length + ' / ' + ACHIEVEMENTS.length + ' unlocked';
+  const p = checkAchievements(loadProgress());          // unlock anything already earned
+  document.getElementById('achievementsSummary').innerHTML =
+    '<b>'+p.achievements.length + ' / ' + ACHIEVEMENTS.length + ' unlocked</b><br><span dir="rtl" style="display:block;margin-top:4px;">الإنجازات أوسمة تُفتح تلقائياً عندما تتدرّب — اضغط على أي وسام لتعرف كيف تحصل عليه.</span>';
   document.getElementById('badgeGrid').innerHTML = ACHIEVEMENTS.map(a=>{
     const unlocked = p.achievements.includes(a.id);
-    return `<div class="badge-tile ${unlocked?'unlocked':''}">
+    const g = achievementProgress(a, p);
+    const pct = unlocked ? 100 : (g ? Math.round(g.cur/g.target*100) : 0);
+    const line = unlocked ? '✓ Unlocked' : (g ? g.cur+' / '+g.target+g.unit : '');
+    return `<div class="badge-tile ${unlocked?'unlocked':''}" onclick="openAchievement('${a.id}')">
       <div class="bico" style="font-size:22px;">${ACHIEVEMENT_EMOJI[a.icon]||'⭐'}</div>
       <b>${esc(a.label)}</b>
+      <div class="bprog"><i style="width:${pct}%"></i></div>
+      <small>${esc(line)}</small>
     </div>`;
   }).join('');
 }
+function openAchievement(id){
+  const a = ACHIEVEMENTS.find(x=>x.id===id); if(!a) return;
+  const p = loadProgress(), unlocked = p.achievements.includes(id), g = achievementProgress(a, p);
+  const goLabel = {call:'Start a voice call', vocabScreen:'Go to Vocabulary', grammarListScreen:'Go to Grammar', readingListScreen:'Go to Reading',
+                   listeningListScreen:'Go to Listening', examListScreen:'Go to Exams', homeScreen:'Back to Home'}[g ? g.info.go : 'homeScreen'];
+  openModal(`<h3>${ACHIEVEMENT_EMOJI[a.icon]||'⭐'} ${esc(a.label)}</h3>
+    <div class="hint" dir="rtl" style="font-size:14px;line-height:1.8;margin-bottom:12px;">${g ? esc(g.info.how) : ''}</div>
+    <div class="hint" style="margin-bottom:16px;font-weight:600;">${unlocked ? '✅ Unlocked — تم الحصول عليه' : (g ? 'Progress: '+g.cur+' / '+g.target+g.unit+' — باقي '+Math.max(0,g.target-g.cur)+g.unit : '')}</div>
+    ${unlocked ? '' : `<button class="btn btn-primary" onclick="closeModal();goAchievement('${g ? g.info.go : 'homeScreen'}')">${goLabel}</button>`}
+    <button class="btn btn-outline" style="margin-top:10px;" onclick="closeModal()">Close</button>`);
+}
+function goAchievement(where){ if(where==='call'){ startVoiceCall(); } else navigate(where); }
 
 </script>
 </body>
