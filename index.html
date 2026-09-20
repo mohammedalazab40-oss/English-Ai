@@ -772,10 +772,11 @@ function hasCustomBackend(){
   return true;
 }
 let GEMINI_LAST_ERROR = '';
-async function geminiJSON(systemText, contents){
+async function geminiJSON(systemText, contents, opts){
+  opts = opts || {};
   const key = getGeminiKey();
   if(!key) throw new Error('no-key');
-  const models = [...new Set([getGeminiModel(), 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.0-flash'])];
+  const models = [...new Set([getGeminiModel(), 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'])];
   let lastErr = null;
   for(const model of models){
     try{
@@ -787,7 +788,7 @@ async function geminiJSON(systemText, contents){
         body: JSON.stringify({
           system_instruction:{parts:[{text:systemText}]},
           contents,
-          generationConfig:{temperature:0.5, responseMimeType:'application/json'}
+          generationConfig:{temperature:(typeof opts.temperature==='number' ? opts.temperature : 0.5), responseMimeType:'application/json'}
         }),
       });
       clearTimeout(timer);
@@ -820,14 +821,14 @@ function toGeminiContents(history){
   return out;
 }
 const MODE_PROMPTS = {
-  free_conversation:'Have a friendly, natural free conversation.',
-  teacher_mode:'Act as a teacher: briefly teach one useful word or structure related to what the student said.',
-  correct_me:'Focus strongly on correcting every grammar or word-choice mistake.',
-  interview_mode:'Role: job interviewer. Ask realistic interview questions one at a time.',
-  travel_mode:'Role-play travel situations (airport, hotel, restaurant, directions).',
-  business_mode:'Role-play business situations (meetings, emails, negotiations) using professional English.',
-  daily_life:'Talk about everyday life: routines, family, food, hobbies, shopping.',
-  role_play:'Invent a short fun role-play scenario and stay in character.',
+  free_conversation:'A relaxed chat between two friends. Talk about your own day, tastes and opinions as much as you ask about theirs.',
+  teacher_mode:'You are their friendly teacher, but still a person: chat normally, and now and then slip in ONE useful word or structure connected to what was just said, with a quick example.',
+  correct_me:'Chat normally like a friend, but catch every grammar or word-choice mistake (put it in "correction"). Do not turn the reply itself into a grammar lesson.',
+  interview_mode:'ROLE-PLAY: you are a hiring manager interviewing the student for a job. React to each answer like a real interviewer (interest, a follow-up, a short comment about the company or the role) before moving on. One question at a time.',
+  travel_mode:'ROLE-PLAY a travel situation and STAY in character as the other person (airport check-in agent, hotel receptionist, waiter, taxi driver, a local giving directions...). Say what that person would really say: prices, options, small problems, small talk. Move to a new situation only when the current one is finished.',
+  business_mode:'ROLE-PLAY a work situation and STAY in character as a colleague, client or supplier (meeting, phone call, negotiation, complaint). You have your own goals and opinions; agree, disagree and propose things in professional English.',
+  daily_life:'Two neighbours or friends chatting about everyday life: routines, family, food, shopping, weekend plans. Share your own little daily stories too.',
+  role_play:'Invent a short, fun scenario with a clear character for yourself and a role for the student, say in one sentence who you both are, then STAY in character and let the scene develop with small surprises.',
 };
 /* ---- TEACHER CONTROL: the student decides how the AI teacher behaves (saved per user) ---- */
 const TUTOR_DEFAULT = {instructions:'', topic:'', length:'medium', correction:'major', speed:'auto', question:true, nativeHelp:true};
@@ -838,7 +839,7 @@ function tutorSystemPrompt(level, mode){
   const c = getTutorCfg(), L = nativeLangNameEn();
   const lengthRule = {short:'Keep "reply" to ONE short sentence (plus the question if questions are enabled).', medium:'Keep "reply" to 1-3 short spoken sentences.', long:'"reply" may be 3-5 sentences so the student gets more listening practice.'}[c.length] || '';
   const corrRule = {all:'Correct EVERY grammar, word-choice and word-order mistake the student makes.', major:'Only correct mistakes that really matter (wrong tense, wrong word, broken structure); ignore tiny slips.', none:'Do NOT correct the student at all: "correction" must always be null.'}[c.correction] || '';
-  let p = 'You are a warm, patient '+accent+' English tutor on a VOICE call with a student whose native language is '+L+', at CEFR level '+level+'. ';
+  let p = 'You are a real, friendly '+accent+' person having a natural spoken VOICE conversation with a learner of English whose native language is '+L+', at CEFR level '+level+'. You are a conversation PARTNER, not an interviewer and not a chatbot. You have your own life, tastes, opinions, moods and little stories (invent ordinary, believable ones and stay consistent with what you said earlier in this call). ';
   if(c.instructions.trim()){
     p += 'THE STUDENT\'S OWN INSTRUCTIONS — HIGHEST PRIORITY. Obey them exactly in every reply; they override the mode and every default rule below (only the JSON output format cannot be changed): <<< '+c.instructions.trim()+' >>> ';
   }
@@ -846,9 +847,11 @@ function tutorSystemPrompt(level, mode){
     p += 'TOPIC: the whole conversation must stay on this topic: "'+c.topic.trim()+'". Never drift to another subject unless the student clearly asks to change it. ';
   }
   p += 'Conversation style: '+(MODE_PROMPTS[mode]||MODE_PROMPTS.free_conversation)+' ';
-  p += 'THE STUDENT LEADS THE CALL. Respond directly to what the student just said. If the student asks you a question, answer it first. If the student gives you an instruction during the call (change topic, speak simpler, explain a word, repeat, stop asking questions, etc.) do it immediately and keep doing it for the rest of the call. Never change the subject on your own, never lecture, never ignore what the student said. ';
+  p += 'HOW A REAL CONVERSATION WORKS — follow this in every reply: (1) React to the MEANING of what the student said, the way a person would: surprise, agreement, disagreement, humour, sympathy. (2) Then ADD something of your own: an opinion, a short personal experience, a fact, a suggestion, a joke. Your own contribution is the main part of the reply. (3) If the student asks you anything, answer it honestly and in detail first, as yourself. ';
+  p += 'STRICTLY FORBIDDEN: repeating or paraphrasing the student\'s sentence back to them; empty filler such as "That is interesting", "I see", "Great", "Tell me more", "Can you give me an example", "How did that make you feel"; praising their English; asking a question you (or they) already asked or answered earlier in this call; using the same opening words or the same sentence pattern as any of your earlier replies; interviewing the student with question after question; lecturing. Read the whole conversation so far and make sure this reply says something NEW and moves the conversation forward. ';
+  p += 'If the student gives you an instruction during the call (change topic, speak simpler, explain a word, repeat, stop asking questions, etc.) do it immediately and keep doing it for the rest of the call. ';
   p += lengthRule+' Use vocabulary suited to level '+level+'. No emojis, no markdown, no lists. ';
-  p += c.question ? 'End with ONE short question that follows naturally from what the student just said. ' : 'Do NOT end with a question unless the student asked you to; just respond and let the student continue. ';
+  p += c.question ? 'Most replies may end with ONE short, specific question that grows out of what was just said — but not every reply: about one reply in three should end with your own statement or opinion instead, so the student can react freely, as in real life. Never ask generic questions. ' : 'Do NOT end with a question unless the student asked you to; just say your part and let the student continue. ';
   p += corrRule+' The student text comes from speech recognition: ignore punctuation/capitalisation problems. ';
   p += c.nativeHelp ? 'The "reply" is in English, except when the student asks for the meaning of something or says they did not understand: then briefly explain in '+L+' inside "reply" and continue in English. ' : 'The "reply" field is in English only. ';
   p += 'Also give "reply_translation": a natural '+L+' translation of your reply, and "user_translation": a '+L+' translation of what the student just said. Write the correction "explanation" in '+L+'. '+
@@ -940,11 +943,12 @@ function localTutorReply(history){
   for(const [re, fix, why] of LOCAL_FIXES){
     if(re.test(text)){ correction = {correct: text.replace(re, fix), explanation: why}; break; }
   }
+  const said = new Set(history.filter(m=>m.role!=='user').map(m=>m.text));
   let reply = null;
   for(const [re, options] of LOCAL_TOPICS){
-    if(re.test(text)){ reply = options[LOCAL_TURN % options.length]; break; }
+    if(re.test(text)){ reply = options.find(o=>!said.has(o)) || null; if(reply) break; }
   }
-  if(!reply) reply = LOCAL_GENERIC[LOCAL_TURN % LOCAL_GENERIC.length];
+  if(!reply) reply = LOCAL_GENERIC.find(o=>!said.has(o)) || LOCAL_GENERIC[LOCAL_TURN % LOCAL_GENERIC.length];
   LOCAL_TURN++;
   return {reply, correction, offline:true};
 }
@@ -1361,14 +1365,35 @@ async function backendPost(path, body){
   return res.json();
 }
 let AI_WARNED = false;
+function normLine(t){ return String(t||'').toLowerCase().replace(/[^a-z0-9 ]/g,'').replace(/\s+/g,' ').trim(); }
+function isRepeatedReply(reply, history){
+  const n = normLine(reply); if(!n) return true;
+  const lastQ = q => { const m = String(q||'').match(/[^.!?]*\?\s*$/); return m ? normLine(m[0]) : ''; };
+  const q = lastQ(reply);
+  const lastUser = [...history].reverse().find(m=>m.role==='user');
+  if(lastUser && normLine(lastUser.text).length > 12 && n.includes(normLine(lastUser.text))) return true;   // echoing the student
+  return history.some(m=> m.role!=='user' && (normLine(m.text)===n || (q && q.length>10 && lastQ(m.text)===q)));
+}
 async function apiGetAiReply(history, level, mode){
+  let reason = '';
   if(getGeminiKey()){
-    try{
-      const d = await geminiJSON(tutorSystemPrompt(level, mode), toGeminiContents(history));
-      if(d && d.reply) return d;
-    }catch(e){
-      if(!AI_WARNED){ AI_WARNED = true; toast('AI key problem: '+GEMINI_LAST_ERROR.slice(0,110)+' — using offline tutor.', 'danger'); }
+    const recent = history.slice(-30);
+    for(let attempt=0; attempt<2; attempt++){
+      try{
+        const contents = toGeminiContents(recent);
+        if(attempt===1 && contents.length) contents[contents.length-1].parts[0].text += '\n(System note, not said by the student: your previous draft repeated something already said in this call. Answer again with completely new content and different wording.)';
+        const d = await geminiJSON(tutorSystemPrompt(level, mode), contents, {temperature: attempt ? 1.0 : 0.85});
+        if(d && d.reply){
+          if(attempt===0 && isRepeatedReply(d.reply, history)) continue;
+          return d;
+        }
+      }catch(e){
+        reason = GEMINI_LAST_ERROR || String(e && e.message || e);
+        if(attempt===0 && !/API key|permission|401|403/i.test(reason)){ await new Promise(r=>setTimeout(r,1200)); continue; }
+        break;
+      }
     }
+    if(!AI_WARNED){ AI_WARNED = true; toast('AI problem: '+(reason||'no reply').slice(0,110)+' — using offline tutor.', 'danger'); }
   }
   if(hasCustomBackend()){
     try{
@@ -1376,7 +1401,9 @@ async function apiGetAiReply(history, level, mode){
     }catch(e){}
   }
   if(!getGeminiKey() && !AI_WARNED){ AI_WARNED = true; toast('Offline tutor mode — add a free Gemini key in Settings for real AI replies.', 'info'); }
-  return localTutorReply(history);
+  const r = localTutorReply(history);
+  r.offlineReason = getGeminiKey() ? (/quota|429|rate|exhaust/i.test(reason) ? 'Gemini free quota reached' : (reason||'AI not reachable')) : 'no AI key';
+  return r;
 }
 
 async function apiScoreConversation(history, level){
@@ -2122,6 +2149,7 @@ async function onUserFinishedSpeaking(text){
     }
     const reply = data.reply || "Sorry, could you say that again?";
     const aiMsg = addMessage('ai', reply);
+    if(data.offline){ aiMsg.offline = data.offlineReason || 'AI not reachable'; renderTranscript(); }
     if(data.reply_translation){ aiMsg.tr = String(data.reply_translation); renderTranscript(); }
     else ensureTranslation(aiMsg);
     await speakThenListen(reply);
@@ -2180,6 +2208,9 @@ function renderTranscript(){
       else if(m.trPending) trHtml = `<span class="bubble-tr pending" dir="${dir}">…</span>`;
     }
     let html = `<div class="bubble-row ${m.role}"><div class="bubble">${esc(m.text)}${trHtml}</div></div>`;
+    if(m.offline){
+      html += `<div class="hint" style="margin:-2px 8px 8px;color:#B7791F;font-size:11.5px;">⚠ Ready-made reply, not the AI — ${esc(m.offline)}</div>`;
+    }
     if(m.correction){
       html += `<div class="correction-box"><b>Correct:</b> ${esc(m.correction)}${m.explanation?'<br><span dir="auto" style="display:block;">'+esc(m.explanation)+'</span>':''}</div>`;
     }
