@@ -738,12 +738,12 @@ function nativeLangOptions(selected){
 }
 const TR_CACHE = {};
 /* Translate English -> native language. Gemini first (if a key exists), then the free MyMemory service. */
-async function translateToNative(text){
+async function translateToNative(text, fast){
   const lang = getNativeLang();
   const ck = lang + '|' + text;
   if(TR_CACHE[ck]) return TR_CACHE[ck];
   let out = '';
-  if(getGeminiKey()){
+  if(getGeminiKey() && !fast){
     try{
       const d = await geminiJSON('Translate the user text from English into natural '+nativeLangNameEn()+'. Return ONLY JSON: {"t":"translation"}.', [{role:'user',parts:[{text}]}]);
       if(d && d.t) out = String(d.t);
@@ -770,7 +770,8 @@ function isLoggedIn(){ return !!getToken(); }
 --------------------------------------------------------------------- */
 function getGeminiKey(){ return (localStorage.getItem('ema_gemini_key')||'').trim(); }
 function setGeminiKey(v){ localStorage.setItem('ema_gemini_key', (v||'').trim()); }
-function getGeminiModel(){ return (localStorage.getItem('ema_gemini_model')||'').trim() || 'gemini-flash-latest'; }
+const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+function getGeminiModel(){ return (localStorage.getItem('ema_gemini_model')||'').trim() || DEFAULT_GEMINI_MODEL; }
 function setGeminiModel(v){ localStorage.setItem('ema_gemini_model', (v||'').trim()); }
 function hasCustomBackend(){
   const u = localStorage.getItem('ema_backend_url');
@@ -779,40 +780,69 @@ function hasCustomBackend(){
   return true;
 }
 let GEMINI_LAST_ERROR = '';
+let GEMINI_LAST_MODEL = '', GEMINI_LAST_MS = 0;
+const GEMINI_BAD = {};                                   // models that returned 404 in this session
+function thinkingOptions(model){
+  const m = model.toLowerCase();
+  if(/pro/.test(m) && !/gemini-3/.test(m)) return [null];
+  if(/gemini-3|latest/.test(m)) return [{thinkingLevel:'minimal'}, {thinkingLevel:'low'}, null];   // Gemini 3.x: no long "thinking"
+  if(/2\.5/.test(m)) return [{thinkingBudget:0}, null];                                          // Gemini 2.5: thinking off
+  return [null];
+}
+function geminiModelList(){
+  const good = (localStorage.getItem('ema_gemini_ok_model')||'').trim();
+  const user = getGeminiModel();
+  const list = [user];
+  if(good && good !== user) list.push(good);
+  list.push(DEFAULT_GEMINI_MODEL, 'gemini-flash-lite-latest', 'gemini-flash-latest', 'gemini-2.5-flash-lite', 'gemini-2.5-flash');
+  return [...new Set(list)].filter(m=>!GEMINI_BAD[m]);
+}
 async function geminiJSON(systemText, contents, opts){
   opts = opts || {};
   const key = getGeminiKey();
   if(!key) throw new Error('no-key');
-  const models = [...new Set([getGeminiModel(), 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'])];
+  const models = opts.onlyModel ? [opts.onlyModel] : geminiModelList();
+  const timeoutMs = opts.timeout || 15000;
   let lastErr = null;
+  modelLoop:
   for(const model of models){
-    try{
-      const ctrl = new AbortController();
-      const timer = setTimeout(()=>ctrl.abort(), 20000);
-      const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent', {
-        method:'POST', signal: ctrl.signal,
-        headers:{'Content-Type':'application/json','x-goog-api-key':key},
-        body: JSON.stringify({
-          system_instruction:{parts:[{text:systemText}]},
-          contents,
-          generationConfig:{temperature:(typeof opts.temperature==='number' ? opts.temperature : 0.5), responseMimeType:'application/json'}
-        }),
-      });
-      clearTimeout(timer);
-      if(!res.ok){
-        let msg = 'HTTP '+res.status;
-        try{ const j = await res.json(); if(j.error && j.error.message) msg = j.error.message; }catch(_){}
-        lastErr = new Error(msg);
-        if(res.status===400 && /API key/i.test(msg)) break;   // bad key — other models won't help
-        if(res.status===401 || res.status===403) break;
-        continue;                                              // 404/429/5xx -> try next model
+    const thinks = thinkingOptions(model);
+    for(let ti=0; ti<thinks.length; ti++){
+      const gc = {temperature:(typeof opts.temperature==='number' ? opts.temperature : 0.5), responseMimeType:'application/json', maxOutputTokens: opts.maxTokens || 700};
+      if(thinks[ti]) gc.thinkingConfig = thinks[ti];
+      const t0 = Date.now();
+      try{
+        const ctrl = new AbortController();
+        const timer = setTimeout(()=>ctrl.abort(), timeoutMs);
+        const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent', {
+          method:'POST', signal: ctrl.signal,
+          headers:{'Content-Type':'application/json','x-goog-api-key':key},
+          body: JSON.stringify({system_instruction:{parts:[{text:systemText}]}, contents, generationConfig:gc}),
+        });
+        clearTimeout(timer);
+        if(!res.ok){
+          let msg = 'HTTP '+res.status;
+          try{ const j = await res.json(); if(j.error && j.error.message) msg = j.error.message; }catch(_){}
+          lastErr = new Error(model+': '+msg);
+          if(res.status===400 && /API key/i.test(msg)) break modelLoop;          // bad key — other models won't help
+          if(res.status===401 || res.status===403) break modelLoop;
+          if(res.status===400 && /think/i.test(msg) && ti < thinks.length-1) continue;   // this model rejects that thinking setting -> try the next one
+          if(res.status===404) GEMINI_BAD[model] = true;
+          continue modelLoop;                                                    // 404/429/5xx -> next model
+        }
+        const data = await res.json();
+        const text = (((data.candidates||[])[0]||{}).content||{}).parts?.filter(p=>!p.thought).map(p=>p.text||'').join('') || '';
+        const clean = text.replace(/```json|```/g,'').trim();
+        const m = clean.match(/\{[\s\S]*\}/);
+        const out = JSON.parse(m ? m[0] : clean);
+        GEMINI_LAST_MODEL = model; GEMINI_LAST_MS = Date.now()-t0;
+        try{ localStorage.setItem('ema_gemini_ok_model', model); }catch(_){}
+        return out;
+      }catch(e){
+        lastErr = new Error(model+': '+(e && e.name==='AbortError' ? 'too slow (no answer in '+Math.round(timeoutMs/1000)+'s)' : (e.message||e)));
+        continue modelLoop;
       }
-      const data = await res.json();
-      const text = (((data.candidates||[])[0]||{}).content||{}).parts?.map(p=>p.text||'').join('') || '';
-      const clean = text.replace(/```json|```/g,'').trim();
-      const m = clean.match(/\{[\s\S]*\}/);
-      return JSON.parse(m ? m[0] : clean);
-    }catch(e){ lastErr = e; }
+    }
   }
   GEMINI_LAST_ERROR = lastErr ? String(lastErr.message||lastErr) : 'unknown';
   throw lastErr || new Error('gemini failed');
@@ -906,7 +936,7 @@ async function buildGreeting(){
   const fallback = c.topic.trim() ? 'Hello! Today we are going to talk about '+c.topic.trim()+'. Are you ready to start?' : 'Hello! Welcome to English Master AI. How are you today?';
   if(!getGeminiKey() || !(c.topic.trim() || c.instructions.trim())) return {reply: fallback};
   try{
-    const d = await geminiJSON(tutorSystemPrompt(CALL.level, CALL.mode), [{role:'user',parts:[{text:'(The call has just started. Greet me briefly and begin exactly according to my instructions and topic. For this first turn set "user_translation" to "" and "correction" to null.)'}]}]);
+    const d = await geminiJSON(tutorSystemPrompt(CALL.level, CALL.mode), [{role:'user',parts:[{text:'(The call has just started. Greet me briefly and begin exactly according to my instructions and topic. For this first turn set "user_translation" to "" and "correction" to null.)'}]}], {timeout:6000, maxTokens:300});
     if(d && d.reply) return d;
   }catch(e){}
   return {reply: fallback};
@@ -1248,7 +1278,7 @@ function openSettings(){
     </div>
     <div class="field">
       <label>Gemini model (optional)</label>
-      <input id="st_gmodel" value="${esc(getGeminiModel())}" placeholder="gemini-flash-latest">
+      <input id="st_gmodel" value="${esc(getGeminiModel())}" placeholder="gemini-3.5-flash-lite">
     </div>
     <div class="field">
       <label>Backend URL (optional, advanced)</label>
@@ -1303,8 +1333,12 @@ async function testGeminiKey(){
   if(!getGeminiKey()){ out.textContent = '⚠️ Paste a key first'; return; }
   out.textContent = 'Testing…';
   try{
-    const d = await geminiJSON('Return ONLY JSON {"reply":"ok"}', [{role:'user',parts:[{text:'ping'}]}]);
-    out.textContent = d ? '✅ Working' : '❌ Empty reply';
+    localStorage.removeItem('ema_gemini_ok_model');
+    const d = await geminiJSON('Return ONLY JSON {"reply":"ok"}', [{role:'user',parts:[{text:'ping'}]}], {timeout:15000});
+    const secs = (GEMINI_LAST_MS/1000).toFixed(1);
+    const slow = GEMINI_LAST_MS > 4000 ? ' ⚠️ slow' : '';
+    const other = GEMINI_LAST_MODEL !== getGeminiModel() ? ' (your model "'+getGeminiModel()+'" failed — used this one instead)' : '';
+    out.textContent = d ? '✅ '+GEMINI_LAST_MODEL+' — '+secs+'s'+slow+other : '❌ Empty reply';
   }catch(e){ out.textContent = '❌ '+GEMINI_LAST_ERROR.slice(0,120); }
 }
 function saveSettings(){
@@ -1387,20 +1421,19 @@ function isRepeatedReply(reply, history){
 async function apiGetAiReply(history, level, mode){
   let reason = '';
   if(getGeminiKey()){
-    const recent = history.slice(-30);
+    const recent = history.slice(-16);
     for(let attempt=0; attempt<2; attempt++){
       try{
         const contents = toGeminiContents(recent);
         if(attempt===1 && contents.length) contents[contents.length-1].parts[0].text += '\n(System note, not said by the student: your previous draft repeated something already said in this call. Answer again with completely new content and different wording.)';
-        const d = await geminiJSON(tutorSystemPrompt(level, mode), contents, {temperature: attempt ? 1.0 : 0.85});
+        const d = await geminiJSON(tutorSystemPrompt(level, mode), contents, {temperature: attempt ? 1.0 : 0.85, timeout:12000, maxTokens:500});
         if(d && d.reply){
           if(attempt===0 && isRepeatedReply(d.reply, history)) continue;
           return d;
         }
       }catch(e){
         reason = GEMINI_LAST_ERROR || String(e && e.message || e);
-        if(attempt===0 && !/API key|permission|401|403/i.test(reason)){ await new Promise(r=>setTimeout(r,1200)); continue; }
-        break;
+        break;   // every model was already tried inside geminiJSON — don't repeat the whole chain
       }
     }
     if(!AI_WARNED){ AI_WARNED = true; toast('AI problem: '+(reason||'no reply').slice(0,110)+' — using offline tutor.', 'danger'); }
@@ -2235,7 +2268,7 @@ async function onUserFinishedSpeaking(text){
 async function ensureTranslation(msg){
   if(!msg || msg.tr || msg.trPending || !getShowTranslation()) return;
   msg.trPending = true; renderTranscript();
-  const t = await translateToNative(msg.text);
+  const t = await translateToNative(msg.text, true);
   msg.trPending = false;
   if(t) msg.tr = t;
   if(!CALL.ended) renderTranscript();

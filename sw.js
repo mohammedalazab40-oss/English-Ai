@@ -1,7 +1,7 @@
 /* English Master AI — service worker
    IMPORTANT: change VERSION every time you upload a new index.html,
    so installed apps pick up the update. */
-const VERSION = 'ema-v5';
+const VERSION = 'ema-v6';
 const APP_CACHE = VERSION + '-app';
 const RUNTIME_CACHE = VERSION + '-runtime';
 const APP_SHELL = [
