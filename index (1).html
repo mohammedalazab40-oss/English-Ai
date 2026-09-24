@@ -291,6 +291,9 @@ a{color:inherit;text-decoration:none;}
 .install-card .x{background:transparent;color:#fff;opacity:.7;padding:6px;font-size:15px;}
 .offline-bar{position:fixed;bottom:0;left:0;right:0;padding-bottom:calc(5px + env(safe-area-inset-bottom));z-index:9999;background:#E6A23C;color:#fff;text-align:center;font-size:12px;font-weight:600;padding:5px 10px;display:none;}
 .offline-bar.show{display:block;}
+.call-notice{margin:6px 8px 12px;padding:12px 14px;border-radius:14px;font-size:13px;line-height:1.55;background:rgba(230,162,60,.14);border:1px solid rgba(230,162,60,.45);color:#F2C27B;}
+.call-notice.stop{background:rgba(224,82,99,.14);border-color:rgba(224,82,99,.5);color:#F4A3AE;}
+.call-notice.wait{background:rgba(92,141,255,.14);border-color:rgba(92,141,255,.45);color:#AFC6FF;}
 .goal-card{margin:12px 20px 0;background:var(--surface);border:1.5px solid var(--line);border-radius:16px;padding:12px 14px;}
 .l-chips{display:flex;gap:8px;overflow-x:auto;padding:4px 20px 10px;scrollbar-width:none;}
 .l-chip{flex-shrink:0;padding:9px 14px;border-radius:999px;font-size:12.5px;font-weight:600;background:var(--surface);border:1.5px solid var(--line);color:var(--ink-2);white-space:nowrap;}
@@ -738,12 +741,12 @@ function nativeLangOptions(selected){
 }
 const TR_CACHE = {};
 /* Translate English -> native language. Gemini first (if a key exists), then the free MyMemory service. */
-async function translateToNative(text){
+async function translateToNative(text, fast){
   const lang = getNativeLang();
   const ck = lang + '|' + text;
   if(TR_CACHE[ck]) return TR_CACHE[ck];
   let out = '';
-  if(getGeminiKey()){
+  if(getGeminiKey() && !fast){
     try{
       const d = await geminiJSON('Translate the user text from English into natural '+nativeLangNameEn()+'. Return ONLY JSON: {"t":"translation"}.', [{role:'user',parts:[{text}]}]);
       if(d && d.t) out = String(d.t);
@@ -768,15 +771,15 @@ function isLoggedIn(){ return !!getToken(); }
    Order: 1) Gemini key saved in Settings  2) custom backend URL (if set)
           3) built-in offline tutor — so the call NEVER breaks.
 --------------------------------------------------------------------- */
-function getGeminiKey(){ return (localStorage.getItem('ema_gemini_key')||'').trim(); }
-function setGeminiKey(v){ localStorage.setItem('ema_gemini_key', (v||'').trim()); }
-function getGeminiModel(){
-  let m = (localStorage.getItem('ema_gemini_model')||'').trim().replace(/^models\//,'');
-  // old / retired names saved on the phone -> replace automatically
-  if(!m || /^gemini-(1\.|2\.0)/.test(m)) m = 'gemini-3.5-flash-lite';
-  return m;
-}
-function setGeminiModel(v){ localStorage.setItem('ema_gemini_model', (v||'').trim().replace(/^models\//,'')); }
+/* several keys allowed (one per line). Each key from a DIFFERENT Google project = its own free quota. */
+function getGeminiKeysRaw(){ return (localStorage.getItem('ema_gemini_key')||'').trim(); }
+function getGeminiKeys(){ return [...new Set(getGeminiKeysRaw().split(/[\s,;]+/).map(k=>k.trim()).filter(k=>k.length>=10))]; }
+function getGeminiKey(){ return getGeminiKeys()[0] || ''; }
+function setGeminiKey(v){ localStorage.setItem('ema_gemini_key', String(v||'').split(/[\s,;]+/).map(k=>k.trim()).filter(Boolean).join('\n')); }
+function keyTag(k){ return '…'+String(k).slice(-4); }
+const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+function getGeminiModel(){ return (localStorage.getItem('ema_gemini_model')||'').trim() || DEFAULT_GEMINI_MODEL; }
+function setGeminiModel(v){ localStorage.setItem('ema_gemini_model', (v||'').trim()); }
 function hasCustomBackend(){
   const u = localStorage.getItem('ema_backend_url');
   if(!u || u === DEFAULT_BACKEND_URL) return false;
@@ -784,59 +787,147 @@ function hasCustomBackend(){
   return true;
 }
 let GEMINI_LAST_ERROR = '';
-let GEMINI_WORKING_MODEL = '';           // remember the model that answered, use it first next time
-const GEMINI_FALLBACKS = ['gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-flash-lite-latest'];
-async function geminiCall(model, key, systemText, contents, opts, withThinking){
-  const gen = {temperature:(typeof opts.temperature==='number' ? opts.temperature : 0.5), responseMimeType:'application/json'};
-  // Gemini 3.x thinks before answering -> keep it minimal so the voice call is fast
-  if(withThinking && /gemini-3/.test(model)) gen.thinkingConfig = {thinkingLevel:'minimal'};
-  const ctrl = new AbortController();
-  const timer = setTimeout(()=>ctrl.abort(), 25000);
-  try{
-    return await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent', {
-      method:'POST', signal: ctrl.signal,
-      headers:{'Content-Type':'application/json','x-goog-api-key':key},
-      body: JSON.stringify({system_instruction:{parts:[{text:systemText}]}, contents, generationConfig:gen}),
-    });
-  } finally { clearTimeout(timer); }
+let GEMINI_LAST_MODEL = '', GEMINI_LAST_MS = 0, GEMINI_LAST_KEY = '';
+let GEMINI_LAST_LIMIT = null;                           // {daily:bool, waitMs:number} when every key/model is rate-limited
+const GEMINI_BAD = {};                                   // models that returned 404 in this session
+const GEMINI_BADKEY = {};                                // keys rejected as invalid in this session
+/* cooldowns per key+model (quota is per project AND per model), kept across reloads */
+let GEMINI_COOL = (()=>{ try{ return JSON.parse(localStorage.getItem('ema_gemini_cool')||'{}'); }catch(_){ return {}; } })();
+function coolId(key, model){ return key.slice(-10)+'|'+model; }
+function coolInfo(key, model){ const c = GEMINI_COOL[coolId(key,model)]; return (c && c.until > Date.now()) ? c : null; }
+function setCool(key, model, ms, daily){
+  const now = Date.now();
+  Object.keys(GEMINI_COOL).forEach(k=>{ if(!GEMINI_COOL[k] || GEMINI_COOL[k].until <= now) delete GEMINI_COOL[k]; });
+  GEMINI_COOL[coolId(key,model)] = {until: now+ms, daily: !!daily};
+  try{ localStorage.setItem('ema_gemini_cool', JSON.stringify(GEMINI_COOL)); }catch(_){}
 }
+function clearGeminiCooldowns(){ GEMINI_COOL = {}; try{ localStorage.removeItem('ema_gemini_cool'); }catch(_){} }
+/* the free daily quota resets at midnight Pacific time */
+function msUntilQuotaReset(){
+  try{
+    const parts = new Intl.DateTimeFormat('en-US',{timeZone:'America/Los_Angeles',hour:'numeric',minute:'numeric',second:'numeric',hourCycle:'h23'}).formatToParts(new Date());
+    const g = t => +((parts.find(p=>p.type===t)||{}).value||0);
+    return Math.max(60000, 86400000 - ((g('hour')%24)*3600 + g('minute')*60 + g('second'))*1000 + 60000);
+  }catch(_){ return 3*3600000; }
+}
+function quotaResetLocalTime(){
+  const d = new Date(Date.now() + msUntilQuotaReset());
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+function parseLimit(err, msg){
+  let secs = 0, daily = false;
+  ((err && err.details) || []).forEach(d=>{
+    if(d && d.retryDelay){ const v = parseFloat(d.retryDelay); if(v) secs = Math.max(secs, v); }
+    ((d && d.violations) || []).forEach(v=>{ if(/per.?day|daily/i.test((v.quotaId||'')+' '+(v.quotaMetric||''))) daily = true; });
+  });
+  const m = String(msg||'').match(/retry in ([\d.]+)\s*s/i);
+  if(m) secs = Math.max(secs, parseFloat(m[1]));
+  if(/per.?day|daily/i.test(String(msg||''))) daily = true;
+  if(daily) return {ms: msUntilQuotaReset(), daily: true};
+  return {ms: Math.min(120, Math.max(5, secs || 30))*1000 + 500, daily: false};
+}
+function thinkingOptions(model){
+  const m = model.toLowerCase();
+  if(/pro/.test(m) && !/gemini-3/.test(m)) return [null];
+  if(/gemini-3|latest/.test(m)) return [{thinkingLevel:'minimal'}, {thinkingLevel:'low'}, null];   // Gemini 3.x: no long "thinking"
+  if(/2\.5/.test(m)) return [{thinkingBudget:0}, null];                                          // Gemini 2.5: thinking off
+  return [null];
+}
+function geminiModelList(){
+  const good = (localStorage.getItem('ema_gemini_ok_model')||'').trim();
+  const user = getGeminiModel();
+  const list = [user];
+  if(good && good !== user) list.push(good);
+  list.push(DEFAULT_GEMINI_MODEL, 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash');
+  return [...new Set(list)].filter(m=>!GEMINI_BAD[m]);
+}
+const sleepMs = ms => new Promise(r=>setTimeout(r, ms));
+/* Tries every key on every model. A key that hits the limit is paused (per model) and the next key/model is used.
+   opts.maxWait (seconds): if everything is only per-minute limited, wait that long once and try again. */
 async function geminiJSON(systemText, contents, opts){
   opts = opts || {};
-  const key = getGeminiKey();
-  if(!key) throw new Error('no-key');
-  const chosen = getGeminiModel();
-  const models = [...new Set([GEMINI_WORKING_MODEL, chosen, ...GEMINI_FALLBACKS].filter(Boolean))].slice(0, 4);
-  const errors = [];
-  for(const model of models){
-    try{
-      let res = await geminiCall(model, key, systemText, contents, opts, true);
-      if(res.status===400){                       // model may not accept thinkingLevel -> retry once without it
-        const t = await res.clone().text();
-        if(/thinking/i.test(t)) res = await geminiCall(model, key, systemText, contents, opts, false);
+  const allKeys = getGeminiKeys();
+  if(!allKeys.length) throw new Error('no-key');
+  const timeoutMs = opts.timeout || 15000;
+  const maxWaitMs = (opts.maxWait || 0) * 1000;
+  let waited = false;
+  GEMINI_LAST_LIMIT = null;
+  while(true){
+    const keys = allKeys.filter(k=>!GEMINI_BADKEY[k]);
+    const models = opts.onlyModel ? [opts.onlyModel] : geminiModelList();
+    let lastErr = keys.length ? null : new Error('every key was rejected as invalid — check the keys in Settings');
+    modelLoop:
+    for(const model of models){
+      keyLoop:
+      for(const key of keys){
+        if(GEMINI_BADKEY[key] || coolInfo(key, model)) continue;
+        const thinks = thinkingOptions(model);
+        for(let ti=0; ti<thinks.length; ti++){
+          const gc = {temperature:(typeof opts.temperature==='number' ? opts.temperature : 0.5), responseMimeType:'application/json', maxOutputTokens: opts.maxTokens || 700};
+          if(thinks[ti]) gc.thinkingConfig = thinks[ti];
+          const t0 = Date.now();
+          try{
+            const ctrl = new AbortController();
+            const timer = setTimeout(()=>ctrl.abort(), timeoutMs);
+            const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+encodeURIComponent(model)+':generateContent', {
+              method:'POST', signal: ctrl.signal,
+              headers:{'Content-Type':'application/json','x-goog-api-key':key},
+              body: JSON.stringify({system_instruction:{parts:[{text:systemText}]}, contents, generationConfig:gc}),
+            });
+            clearTimeout(timer);
+            if(!res.ok){
+              let msg = 'HTTP '+res.status, errObj = null;
+              try{ const j = await res.json(); errObj = j.error || null; if(errObj && errObj.message) msg = errObj.message; }catch(_){}
+              lastErr = new Error(model+' '+keyTag(key)+': '+msg);
+              if(res.status===429 || /quota|exhaust|rate.?limit/i.test(msg)){
+                const L = parseLimit(errObj, msg);
+                setCool(key, model, L.ms, L.daily);
+                continue keyLoop;                                              // same model, next key
+              }
+              if((res.status===400 && /API key/i.test(msg)) || res.status===401 || res.status===403){ GEMINI_BADKEY[key] = true; continue keyLoop; }
+              if(res.status===400 && /think/i.test(msg) && ti < thinks.length-1) continue;   // try the next thinking setting
+              if(res.status===404){ GEMINI_BAD[model] = true; continue modelLoop; }
+              continue modelLoop;                                                // 5xx / overloaded -> next model
+            }
+            const data = await res.json();
+            const text = (((data.candidates||[])[0]||{}).content||{}).parts?.filter(p=>!p.thought).map(p=>p.text||'').join('') || '';
+            const clean = text.replace(/```json|```/g,'').trim();
+            const m = clean.match(/\{[\s\S]*\}/);
+            const out = JSON.parse(m ? m[0] : clean);
+            GEMINI_LAST_MODEL = model; GEMINI_LAST_KEY = key; GEMINI_LAST_MS = Date.now()-t0;
+            try{ localStorage.setItem('ema_gemini_ok_model', model); }catch(_){}
+            return out;
+          }catch(e){
+            lastErr = new Error(model+': '+(e && e.name==='AbortError' ? 'too slow (no answer in '+Math.round(timeoutMs/1000)+'s)' : (e.message||e)));
+            continue modelLoop;
+          }
+        }
       }
-      if(!res.ok){
-        let msg = 'HTTP '+res.status;
-        try{ const j = await res.json(); if(j.error && j.error.message) msg = j.error.message; }catch(_){}
-        errors.push(model+': '+msg);
-        if(res.status===400 && /API key/i.test(msg)) break;   // bad key — other models won't help
-        if(res.status===401 || res.status===403) break;
-        continue;                                              // 404/429/5xx -> try next model
-      }
-      const data = await res.json();
-      const text = (((data.candidates||[])[0]||{}).content||{}).parts?.filter(p=>!p.thought).map(p=>p.text||'').join('') || '';
-      const clean = text.replace(/```json|```/g,'').trim();
-      const m = clean.match(/\{[\s\S]*\}/);
-      const out = JSON.parse(m ? m[0] : clean);
-      GEMINI_WORKING_MODEL = model;
-      GEMINI_LAST_ERROR = '';
-      return out;
-    }catch(e){
-      errors.push(model+': '+(e && e.name==='AbortError' ? 'timeout (no answer in 25s)' : String(e && e.message || e)));
     }
+    // nothing worked — is it only because of limits?
+    let soonest = Infinity, anyCool = false, allDaily = true, anyFree = false;
+    keys.forEach(k=> models.forEach(m=>{
+      const c = coolInfo(k, m);
+      if(!c){ anyFree = true; return; }
+      anyCool = true;
+      if(!c.daily){ allDaily = false; soonest = Math.min(soonest, c.until - Date.now()); }
+    }));
+    const limited = anyCool && !anyFree;
+    if(limited && !allDaily && !waited && maxWaitMs && soonest <= maxWaitMs){
+      waited = true;
+      if(opts.onWait) try{ opts.onWait(Math.ceil(soonest/1000)); }catch(_){}
+      await sleepMs(soonest + 300);
+      continue;
+    }
+    if(limited){
+      GEMINI_LAST_LIMIT = {daily: allDaily, waitMs: allDaily ? msUntilQuotaReset() : soonest};
+      GEMINI_LAST_ERROR = allDaily ? 'Gemini free quota for today is used up on all keys' : 'Gemini free per-minute limit reached — wait '+Math.ceil(soonest/1000)+'s';
+      const e = new Error(GEMINI_LAST_ERROR); e.quota = true; e.daily = allDaily; e.waitMs = GEMINI_LAST_LIMIT.waitMs;
+      throw e;
+    }
+    GEMINI_LAST_ERROR = lastErr ? String(lastErr.message||lastErr) : 'unknown';
+    throw lastErr || new Error('gemini failed');
   }
-  // show the error of the model the user chose (the first one), not the last fallback
-  GEMINI_LAST_ERROR = errors[0] || 'unknown';
-  throw new Error(GEMINI_LAST_ERROR);
 }
 function toGeminiContents(history){
   const out = [];
@@ -927,7 +1018,7 @@ async function buildGreeting(){
   const fallback = c.topic.trim() ? 'Hello! Today we are going to talk about '+c.topic.trim()+'. Are you ready to start?' : 'Hello! Welcome to English Master AI. How are you today?';
   if(!getGeminiKey() || !(c.topic.trim() || c.instructions.trim())) return {reply: fallback};
   try{
-    const d = await geminiJSON(tutorSystemPrompt(CALL.level, CALL.mode), [{role:'user',parts:[{text:'(The call has just started. Greet me briefly and begin exactly according to my instructions and topic. For this first turn set "user_translation" to "" and "correction" to null.)'}]}]);
+    const d = await geminiJSON(tutorSystemPrompt(CALL.level, CALL.mode), [{role:'user',parts:[{text:'(The call has just started. Greet me briefly and begin exactly according to my instructions and topic. For this first turn set "user_translation" to "" and "correction" to null.)'}]}], {timeout:6000, maxTokens:300});
     if(d && d.reply) return d;
   }catch(e){}
   return {reply: fallback};
@@ -1258,8 +1349,9 @@ function openSettings(){
     <h3>Settings</h3>
     <div class="hint" style="margin-bottom:14px;">Signed in as <b>${esc(getUsername())}</b></div>
     <div class="field">
-      <label>Gemini API Key (free) — powers the AI teacher</label>
-      <input id="st_gkey" type="password" value="${esc(getGeminiKey())}" placeholder="AIza..." autocomplete="off">
+      <label>Gemini API Keys (free) — one key per line</label>
+      <textarea id="st_gkey" rows="3" placeholder="AIza...&#10;AIza...&#10;AIza..." autocomplete="off" spellcheck="false" style="width:100%;padding:12px 14px;border:1.5px solid var(--line);border-radius:14px;font-size:13px;font-family:monospace;resize:vertical;">${esc(getGeminiKeysRaw())}</textarea>
+      <div class="hint" style="margin-top:6px;" dir="auto">ضع أكثر من مفتاح، كل مفتاح من <b>مشروع مختلف</b> في Google AI Studio. لما حصة مفتاح تخلص، التطبيق يستخدم اللي بعده تلقائياً.</div>
     </div>
     <div class="hint" style="margin-bottom:12px;">
       Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" style="color:var(--blue);font-weight:600;">aistudio.google.com/apikey</a>
@@ -1321,12 +1413,26 @@ async function testGeminiKey(){
   const out = document.getElementById('st_gtest');
   setGeminiKey(document.getElementById('st_gkey').value);
   setGeminiModel(document.getElementById('st_gmodel').value);
-  if(!getGeminiKey()){ out.textContent = '⚠️ Paste a key first'; return; }
-  out.textContent = 'Testing…';
-  try{
-    const d = await geminiJSON('Return ONLY JSON {"reply":"ok"}', [{role:'user',parts:[{text:'ping'}]}]);
-    out.textContent = d ? '✅ Working' : '❌ Empty reply';
-  }catch(e){ out.textContent = '❌ '+GEMINI_LAST_ERROR.slice(0,120); }
+  const keys = getGeminiKeys();
+  if(!keys.length){ out.textContent = '⚠️ Paste a key first'; return; }
+  out.style.whiteSpace = 'pre-line';
+  out.textContent = 'Testing '+keys.length+' key(s)…';
+  localStorage.removeItem('ema_gemini_ok_model');
+  clearGeminiCooldowns();
+  Object.keys(GEMINI_BADKEY).forEach(k=>delete GEMINI_BADKEY[k]);
+  const saved = getGeminiKeysRaw(), lines = [];
+  for(let i=0;i<keys.length;i++){
+    localStorage.setItem('ema_gemini_key', keys[i]);            // test each key on its own
+    try{
+      const d = await geminiJSON('Return ONLY JSON {"reply":"ok"}', [{role:'user',parts:[{text:'ping'}]}], {timeout:15000});
+      const secs = (GEMINI_LAST_MS/1000).toFixed(1);
+      lines.push((d ? '✅ ' : '❌ ')+'Key '+(i+1)+' '+keyTag(keys[i])+' — '+GEMINI_LAST_MODEL+' '+secs+'s');
+    }catch(e){
+      lines.push('❌ Key '+(i+1)+' '+keyTag(keys[i])+' — '+(e.quota ? (e.daily ? 'daily quota used up' : 'per-minute limit, try again soon') : GEMINI_LAST_ERROR.slice(0,90)));
+    }
+    out.textContent = lines.join('\n');
+  }
+  localStorage.setItem('ema_gemini_key', saved);
 }
 function saveSettings(){
   setGeminiKey(document.getElementById('st_gkey').value);
@@ -1406,32 +1512,34 @@ function isRepeatedReply(reply, history){
   return history.some(m=> m.role!=='user' && (normLine(m.text)===n || (q && q.length>10 && lastQ(m.text)===q)));
 }
 async function apiGetAiReply(history, level, mode){
-  let reason = '';
+  let reason = '', quotaErr = null;
   if(getGeminiKey()){
-    const recent = history.slice(-30);
+    const recent = history.slice(-16);
     for(let attempt=0; attempt<2; attempt++){
       try{
         const contents = toGeminiContents(recent);
         if(attempt===1 && contents.length) contents[contents.length-1].parts[0].text += '\n(System note, not said by the student: your previous draft repeated something already said in this call. Answer again with completely new content and different wording.)';
-        const d = await geminiJSON(tutorSystemPrompt(level, mode), contents, {temperature: attempt ? 1.0 : 0.85});
+        const d = await geminiJSON(tutorSystemPrompt(level, mode), contents, {temperature: attempt ? 1.0 : 0.85, timeout:12000, maxTokens:500, maxWait:25, onWait: secs=>showCallWait(secs)});
         if(d && d.reply){
           if(attempt===0 && isRepeatedReply(d.reply, history)) continue;
           return d;
         }
       }catch(e){
         reason = GEMINI_LAST_ERROR || String(e && e.message || e);
-        if(attempt===0 && !/API key|permission|401|403/i.test(reason)){ await new Promise(r=>setTimeout(r,1200)); continue; }
-        break;
+        if(e && e.quota){ quotaErr = e; }
+        break;   // every key and model was already tried inside geminiJSON — don't repeat the whole chain
       }
     }
-    if(!AI_WARNED){ AI_WARNED = true; toast('AI problem: '+(reason||'no reply').slice(0,110)+' — using offline tutor.', 'danger'); }
+    clearCallNotice();
   }
   if(hasCustomBackend()){
     try{
       return await backendPost('/conversation/respond', {level, mode, history: history.map(m=>({role: m.role==='user'?'user':'assistant', text: m.text}))});
     }catch(e){}
   }
-  if(!getGeminiKey() && !AI_WARNED){ AI_WARNED = true; toast('Offline tutor mode — add a free Gemini key in Settings for real AI replies.', 'info'); }
+  // A key exists but the AI did not answer: say so honestly instead of a ready-made reply that ignores the student.
+  if(getGeminiKey()) return {aiDown:true, quota: !!quotaErr, daily: !!(quotaErr && quotaErr.daily), waitMs: quotaErr ? quotaErr.waitMs : 0, reason};
+  if(!AI_WARNED){ AI_WARNED = true; toast('Offline tutor mode — add a free Gemini key in Settings for real AI replies.', 'info'); }
   const r = localTutorReply(history);
   r.offlineReason = getGeminiKey() ? (/quota|429|rate|exhaust/i.test(reason) ? 'Gemini free quota reached' : (reason||'AI not reachable')) : 'no AI key';
   return r;
@@ -1936,7 +2044,7 @@ function levelRate(level){
 }
 
 function startVoiceCall(){
-  CALL.messages = [];
+  CALL.messages = []; CALL.notice = null;
   CALL.mode = 'free_conversation';
   CALL.level = getLevel();
   CALL.muted = false;
@@ -2225,6 +2333,9 @@ async function onUserFinishedSpeaking(text){
   setThinkingUI(true);
   try{
     const data = await apiGetAiReply(CALL.messages, CALL.level, CALL.mode);
+    if(CALL.ended) return;
+    if(data.aiDown){ await handleAiDown(data, userMsg); return; }
+    clearCallNotice();
     if(data.user_translation){ userMsg.tr = String(data.user_translation); renderTranscript(); }
     else ensureTranslation(userMsg);
     let spokenCorr = '';
@@ -2252,11 +2363,43 @@ async function onUserFinishedSpeaking(text){
   }
 }
 
+/* ---- AI limit / AI down: honest notice instead of a fake reply ---- */
+function showCallWait(secs){
+  if(!CALL || CALL.ended) return;
+  CALL.notice = {kind:'wait', en:'⏳ AI limit for this minute — waiting '+secs+'s, then answering…', ar:'⏳ الحد المسموح في الدقيقة انتهى — ثواني ويرد تلقائياً ('+secs+'ث)'};
+  setCallStatus('Waiting '+secs+'s…');
+  renderTranscript();
+}
+function clearCallNotice(){ if(CALL && CALL.notice){ CALL.notice = null; renderTranscript(); } }
+async function handleAiDown(data, userMsg){
+  ensureTranslation(userMsg);
+  let en, ar, spoken;
+  if(data.quota && data.daily){
+    const t = quotaResetLocalTime();
+    en = '⛔ The free Gemini quota for today is used up on all your keys. It renews at about '+t+'. Add another key (from a new project) in Settings to continue now.';
+    ar = '⛔ حصة Gemini المجانية لليوم خلصت على كل المفاتيح. بتتجدد حوالي الساعة '+t+'. ضيف مفتاح من مشروع جديد في الإعدادات عشان تكمل دلوقتي.';
+    spoken = "Sorry, the AI has reached today's free limit. Please add another key in Settings, or try again later.";
+  } else if(data.quota){
+    const s = Math.max(5, Math.ceil((data.waitMs||30000)/1000));
+    en = '⏳ The AI is busy (per-minute limit). Wait about '+s+' seconds, then say your sentence again.';
+    ar = '⏳ الذكاء الاصطناعي مشغول (حد الدقيقة). استنى حوالي '+s+' ثانية وقول جملتك تاني.';
+    spoken = 'Sorry, I need a short break. Please wait a moment and say that again.';
+  } else {
+    en = '⚠ The AI did not answer: '+String(data.reason||'no connection').slice(0,120)+'. Say your sentence again.';
+    ar = '⚠ الذكاء الاصطناعي ما ردش. اتأكد من الإنترنت وقول جملتك تاني.';
+    spoken = 'Sorry, I could not hear the AI. Please say that again.';
+  }
+  CALL.notice = {kind: data.quota && data.daily ? 'stop' : 'warn', en, ar};
+  setCallStatus('AI not available');
+  renderTranscript();
+  await speakThenListen(spoken);
+}
+
 /* fetch a translation for a message that does not have one yet (offline tutor, greeting, etc.) */
 async function ensureTranslation(msg){
   if(!msg || msg.tr || msg.trPending || !getShowTranslation()) return;
   msg.trPending = true; renderTranscript();
-  const t = await translateToNative(msg.text);
+  const t = await translateToNative(msg.text, true);
   msg.trPending = false;
   if(t) msg.tr = t;
   if(!CALL.ended) renderTranscript();
@@ -2307,7 +2450,7 @@ function renderTranscript(){
       html += `<div class="correction-box"><b>Correct:</b> ${esc(m.correction)}${m.explanation?'<br><span dir="auto" style="display:block;">'+esc(m.explanation)+'</span>':''}${m.practice?'<br><span style="display:block;opacity:.85;">'+esc(m.practice)+'</span>':''}</div>`;
     }
     return html;
-  }).join('');
+  }).join('') + (CALL.notice ? `<div class="call-notice ${CALL.notice.kind}"><div>${esc(CALL.notice.en)}</div>${getNativeLang()==='ar' ? `<div dir="rtl" style="margin-top:6px;">${esc(CALL.notice.ar)}</div>` : ''}${CALL.notice.kind==='stop' ? `<button class="btn btn-outline" style="margin-top:10px;padding:8px 14px;font-size:13px;" onclick="endCall();openSettings();">Open Settings</button>` : ''}</div>` : '');
   el.scrollTop = el.scrollHeight;
 }
 
